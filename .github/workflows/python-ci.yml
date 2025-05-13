@@ -1,62 +1,109 @@
-name: Python CI for Spitec
+name: Python CI for Spitec (Dash with Poetry)
 
-# События, которые будут запускать этот workflow
 on:
-  push: # При пуше в любую ветку
-    branches: [ main, master, develop ] # Укажите ваши основные ветки
-  pull_request: # При создании или обновлении pull request
+  push:
+    branches: [ main, master, develop ] # Настройте под ваши ветки
+  pull_request:
     branches: [ main, master, develop ]
 
 jobs:
-  build-and-test:
-    # Тип раннера, на котором будет выполняться задача.
-    # GitHub предоставляет раннеры Ubuntu, Windows, macOS.
-    # Для большинства Python-проектов ubuntu-latest подходит.
+  build-lint-test:
     runs-on: ubuntu-latest
-
     strategy:
+      fail-fast: false
       matrix:
-        # Можно тестировать на нескольких версиях Python
-        python-version: ["3.9", "3.10", "3.11"]
+        python-version: ["3.10", "3.11"]
 
     steps:
       - name: Check out repository code
-        uses: actions/checkout@v4 # Используем готовое действие (action)
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-
-      - name: Install dependencies
+      - name: Install Poetry
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # Если есть отдельные зависимости для разработки/тестирования:
-          # pip install -r requirements-dev.txt
+          pip install poetry
+          poetry --version
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+      
+      - name: Get pip cache dir
+        id: pip_cache
+        run: |
+          echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pip_cache.outputs.dir }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Configure Poetry
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry config virtualenvs.create true
+
+      - name: Install dependencies with Poetry
+        run: |
+          # Устанавливаем все группы зависимостей (main, dev, deploy), 
+          # так как gunicorn может быть в deploy или dev
+          poetry install --no-interaction --no-ansi 
+          # Если Gunicorn в main, то можно:
+          # poetry install --no-interaction --no-ansi --only main,dev 
+          # (предполагая, что flake8 и pytest в dev)
 
       - name: Lint with flake8
         run: |
-          pip install flake8
-          # Проверяем все .py файлы, исключая некоторые директории
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Или более простая команда, если нет специфичных требований:
-          # flake8 .
+          poetry run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Или более простая команда:
+          # poetry run flake8 .
 
-
-      - name: Check Streamlit app startup (optional)
+      - name: Test with pytest
         run: |
-          # Попробуем запустить Streamlit в фоновом режиме и быстро проверить
-          # Это очень упрощенная проверка.
-          streamlit run app.py --server.runOnSave false --server.headless true &
-          sleep 10 # Даем немного времени на запуск
-          # Проверим, есть ли процесс streamlit
-          if pgrep -f "streamlit run app.py"; then
-            echo "Streamlit process found."
-            # Убиваем процесс
-            pkill -f "streamlit run app.py"
+          poetry run pytest
+
+      - name: Check Dash app startup with Gunicorn
+        if: matrix.python-version == '3.10' # Запускаем эту проверку только для одной версии Python
+        env:
+          # Можно задать переменные окружения, если ваше Dash-приложение их требует для запуска
+          # MY_APP_SETTING: "some_value"
+          PORT: 8050 # Порт, на котором Gunicorn будет пытаться запуститься
+        run: |
+          echo "Attempting to start Dash app with Gunicorn on port $PORT..."
+          # Запускаем Gunicorn из виртуального окружения Poetry
+          # app:server - app это имя вашего .py файла (app.py), server - переменная Flask server (app.server)
+          poetry run gunicorn app:server --bind 0.0.0.0:$PORT --workers 1 &
+          GUNICORN_PID=$!
+          sleep 15 # Даем время на запуск
+
+          # Проверяем, жив ли процесс по PID
+          if kill -0 $GUNICORN_PID 2>/dev/null; then
+            echo "Dash app (Gunicorn PID $GUNICORN_PID) is running on port $PORT."
+            # Можно дополнительно попробовать сделать curl запрос
+            if curl --fail --silent http://127.0.0.1:$PORT > /dev/null; then
+              echo "Successfully connected to Dash app on port $PORT."
+            else
+              echo "Failed to connect to Dash app on port $PORT via curl."
+              # Попробуем убить Gunicorn и выйти с ошибкой
+              kill $GUNICORN_PID
+              wait $GUNICORN_PID 2>/dev/null
+              exit 1
+            fi
+            kill $GUNICORN_PID
+            wait $GUNICORN_PID 2>/dev/null
+            echo "Dash app (Gunicorn) process stopped."
           else
-            echo "Streamlit process not found. Startup might have failed."
+            echo "Dash app (Gunicorn PID $GUNICORN_PID) not found after 15s. Startup might have failed."
             exit 1
           fi
