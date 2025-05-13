@@ -8,15 +8,19 @@ on:
 
 jobs:
   build-lint-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # Используем Linux-раннер, где Poetry обычно работает без проблем
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
+        python-version: ["3.10"] # Для обновления lock-файла достаточно одной версии
 
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
+        with:
+          # Нам нужен токен для пуша изменений обратно в репозиторий
+          # GITHUB_TOKEN имеет права на пуш в репозиторий, где запущен workflow
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -28,74 +32,97 @@ jobs:
           pip install poetry
           poetry --version
 
-      - name: Cache Poetry virtualenv
-        uses: actions/cache@v4
-        with:
-          path: .venv
-          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
-          restore-keys: |
-            ${{ runner.os }}-poetry-
-      
-      - name: Get pip cache dir
-        id: pip_cache
-        run: |
-          echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.pip_cache.outputs.dir }}
-          key: ${{ runner.os }}-pip-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      # Не используем кэш перед poetry lock, чтобы гарантировать свежее разрешение зависимостей
+      # Кэш можно включить для последующих шагов, если lock-файл не менялся
 
       - name: Configure Poetry
         run: |
           poetry config virtualenvs.in-project true
           poetry config virtualenvs.create true
 
+      - name: Check if lock file is up-to-date and run poetry lock if needed
+        id: lock_check
+        run: |
+          # Попробуем установить. Если lock файл не синхронизирован, poetry install упадет.
+          # Мы можем перехватить ошибку или просто запустить lock, а потом проверить изменения.
+          # Более простой подход: всегда запускать lock, потом проверять изменения.
+          echo "Running poetry lock to ensure poetry.lock is up-to-date..."
+          poetry lock --no-update # --no-update пытается обновить lock только на основе pyproject.toml, не обновляя сами зависимости до последних версий
+                                  # Если вы хотите обновить зависимости до последних разрешенных версий, уберите --no-update
+          
+          # Проверяем, изменился ли poetry.lock
+          if git diff --quiet HEAD -- poetry.lock; then
+            echo "poetry.lock is up-to-date."
+            echo "is_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "poetry.lock was updated."
+            echo "is_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push updated poetry.lock
+        if: steps.lock_check.outputs.is_changed == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add poetry.lock
+          git commit -m "chore: Update poetry.lock [CI]"
+          # Перед пушем убедимся, что мы на ветке, с которой пришел push или PR
+          # Это важно, чтобы не пытаться пушить в отсоединенный HEAD для PR от форков
+          BRANCH_NAME=${{ github.head_ref || github.ref_name }}
+          echo "Attempting to push to branch: $BRANCH_NAME"
+          git push origin "$BRANCH_NAME"
+          echo "poetry.lock has been committed and pushed."
+          # Можно добавить шаг для "провала" workflow здесь, чтобы он перезапустился уже с новым lock-файлом
+          # echo "Failing workflow to restart with updated lock file."
+          # exit 1 
+          # Или просто продолжить, но следующий poetry install может использовать старый кэш (если он есть до этого шага)
+
+      # ----- Дальнейшие шаги CI (установка, линтинг, тесты) -----
+      # Теперь можно использовать кэш, так как lock-файл должен быть актуальным
+      - name: Get pip cache dir
+        id: pip_cache
+        if: steps.lock_check.outputs.is_changed == 'false' # Кэш имеет смысл, если lock не менялся
+        run: |
+          echo "dir=$(pip cache dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        if: steps.lock_check.outputs.is_changed == 'false' # Кэш имеет смысл, если lock не менялся
+        with:
+          path: ${{ steps.pip_cache.outputs.dir }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('poetry.lock') }}-${{ matrix.python-version }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies with Poetry
         run: |
-          # Устанавливаем все группы зависимостей (main, dev, deploy), 
-          # так как gunicorn может быть в deploy или dev
+          # Теперь poetry install должен пройти успешно
           poetry install --no-interaction --no-ansi 
-          # Если Gunicorn в main, то можно:
-          # poetry install --no-interaction --no-ansi --only main,dev 
-          # (предполагая, что flake8 и pytest в dev)
-
+          
       - name: Lint with flake8
         run: |
           poetry run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Или более простая команда:
-          # poetry run flake8 .
 
       - name: Test with pytest
         run: |
           poetry run pytest
 
       - name: Check Dash app startup with Gunicorn
-        if: matrix.python-version == '3.10' # Запускаем эту проверку только для одной версии Python
+        # if: matrix.python-version == '3.10' # Если у вас одна версия в matrix, это условие не нужно
         env:
-          # Можно задать переменные окружения, если ваше Dash-приложение их требует для запуска
-          # MY_APP_SETTING: "some_value"
-          PORT: 8050 # Порт, на котором Gunicorn будет пытаться запуститься
+          PORT: 8050
         run: |
           echo "Attempting to start Dash app with Gunicorn on port $PORT..."
-          # Запускаем Gunicorn из виртуального окружения Poetry
-          # app:server - app это имя вашего .py файла (app.py), server - переменная Flask server (app.server)
           poetry run gunicorn app:server --bind 0.0.0.0:$PORT --workers 1 &
           GUNICORN_PID=$!
-          sleep 15 # Даем время на запуск
+          sleep 15
 
-          # Проверяем, жив ли процесс по PID
           if kill -0 $GUNICORN_PID 2>/dev/null; then
             echo "Dash app (Gunicorn PID $GUNICORN_PID) is running on port $PORT."
-            # Можно дополнительно попробовать сделать curl запрос
             if curl --fail --silent http://127.0.0.1:$PORT > /dev/null; then
               echo "Successfully connected to Dash app on port $PORT."
             else
               echo "Failed to connect to Dash app on port $PORT via curl."
-              # Попробуем убить Gunicorn и выйти с ошибкой
               kill $GUNICORN_PID
               wait $GUNICORN_PID 2>/dev/null
               exit 1
