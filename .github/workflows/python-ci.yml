@@ -1,0 +1,62 @@
+name: Python CI for Spitec
+
+# События, которые будут запускать этот workflow
+on:
+  push: # При пуше в любую ветку
+    branches: [ main, master, develop ] # Укажите ваши основные ветки
+  pull_request: # При создании или обновлении pull request
+    branches: [ main, master, develop ]
+
+jobs:
+  build-and-test:
+    # Тип раннера, на котором будет выполняться задача.
+    # GitHub предоставляет раннеры Ubuntu, Windows, macOS.
+    # Для большинства Python-проектов ubuntu-latest подходит.
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # Можно тестировать на нескольких версиях Python
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4 # Используем готовое действие (action)
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Если есть отдельные зависимости для разработки/тестирования:
+          # pip install -r requirements-dev.txt
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          # Проверяем все .py файлы, исключая некоторые директории
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Или более простая команда, если нет специфичных требований:
+          # flake8 .
+
+
+      - name: Check Streamlit app startup (optional)
+        run: |
+          # Попробуем запустить Streamlit в фоновом режиме и быстро проверить
+          # Это очень упрощенная проверка.
+          streamlit run app.py --server.runOnSave false --server.headless true &
+          sleep 10 # Даем немного времени на запуск
+          # Проверим, есть ли процесс streamlit
+          if pgrep -f "streamlit run app.py"; then
+            echo "Streamlit process found."
+            # Убиваем процесс
+            pkill -f "streamlit run app.py"
+          else
+            echo "Streamlit process not found. Startup might have failed."
+            exit 1
+          fi
